@@ -1,7 +1,14 @@
 {
-  "name": "claude-video",
-  "version": "0.0.1",
-  "description": "Installer for the claude-video Claude Code skill",
+  "name": "claude-video-install",
+  "version": "0.1.0",
+  "description": "Installer for the claude-video Claude Code skill — teach Claude Code to watch videos.",
+  "homepage": "https://github.com/marques-hue/claude-video-watch",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marques-hue/claude-video-watch.git"
+  },
+  "keywords": ["claude", "claude-code", "skill", "video", "gemini", "whisper", "reel"],
+  "author": "Marques Allen Lilly",
   "type": "module",
   "bin": {
     "claude-video-install": "bin/install.js"

@@ -5,7 +5,7 @@ description: Analyze and break down videos dropped into the conversation. Trigge
 
 # Video Watch
 
-Claude does not natively ingest video files. This skill bridges that gap. When the user drops a video, run the pipeline at `C:/Users/Marqu/Desktop/claude-video-watch/video_analyze.py`, read the resulting JSON, and present the structured breakdown.
+Claude does not natively ingest video files. This skill bridges that gap. When the user drops a video, run the pipeline at `{{SKILL_ROOT}}/video_analyze.py`, read the resulting JSON, and present the structured breakdown.
 
 ## When to invoke
 
@@ -26,7 +26,7 @@ Do NOT invoke for:
 3. Run the pipeline:
 
 ```bash
-python C:/Users/Marqu/Desktop/claude-video-watch/video_analyze.py "<video-path>"
+python {{SKILL_ROOT}}/video_analyze.py "<video-path>"
 ```
 
 Optional flags:
@@ -40,7 +40,9 @@ Optional flags:
 
 ## How to present the result
 
-Lead with the retention structure: hook, agitate, re-hook, tell-them, aha, CTA. That is the shape the user cares about. Then offer the visual beats, on-screen text, and emotional arc as follow-up sections.
+Lead with the retention structure: hook (verbatim quote + technique + why it works), re-hook (named pattern-interrupt + what would happen without it), agitate, aha-moment, CTA (explicit/implicit/none). Then retention_mechanics (named patterns at timestamps), replication_checklist (3-7 copyable items), visual_beats, on_screen_text, emotional_arc.
+
+The v2 schema (`schema_version: 2`) deepens hook/re_hook/cta from strings to objects. If the JSON is v1 (strings), render them as-is.
 
 Keep voice aligned with Marques' brand rules from his global CLAUDE.md:
 - No em dashes.
@@ -60,7 +62,7 @@ After the initial breakdown, offer one-line prompts:
 
 - `.env` file in the skill directory with `VIDEO_PROVIDER` and the matching API key. Written by `npx claude-video-install`.
 - `ffmpeg` on PATH.
-- Python dependencies installed: `pip install -r C:/Users/Marqu/Desktop/claude-video-watch/requirements.txt`.
+- Python dependencies installed: `pip install -r {{SKILL_ROOT}}/requirements.txt`.
 
 ## Failure modes
 

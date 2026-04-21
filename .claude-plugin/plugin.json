@@ -1,0 +1,8 @@
+{
+  "name": "video-watch",
+  "description": "Analyze short-form video locally. Retention, hooks, on-screen text, beat-aligned frames and speech.",
+  "version": "0.1.0",
+  "author": "Marques Allen Lilly",
+  "homepage": "https://github.com/marques-hue/claude-video-watch",
+  "skills": "./skills/video-watch"
+}

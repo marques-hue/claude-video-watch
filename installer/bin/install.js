@@ -18,7 +18,7 @@ import {
 } from 'node:fs';
 
 // --- Branding ---------------------------------------------------------------
-const PKG_VERSION = '0.0.1';
+const PKG_VERSION = '0.1.0';
 const USE_COLOR = process.stdout.isTTY && !process.env.NO_COLOR;
 const paint = (code, s) => (USE_COLOR ? `\x1b[${code}m${s}\x1b[0m` : s);
 const terracotta = (s) => paint('38;2;210;93;56', s); // #D25D38
@@ -185,12 +185,11 @@ async function main() {
   const skillMdSrc = skillMdCandidates.find(existsSync);
   if (!skillMdSrc) throw new Error('SKILL.md not found in payload.');
 
-  // Rewrite hardcoded Desktop path in SKILL.md to the install location
+  // Rewrite install-location token in SKILL.md.
+  const skillRoot = SKILL_DST.replaceAll('\\', '/');
   const skillMd = readFileSync(skillMdSrc, 'utf8')
-    .replaceAll(
-      'C:/Users/Marqu/Desktop/claude-video-watch',
-      SKILL_DST.replaceAll('\\', '/'),
-    )
+    .replaceAll('{{SKILL_ROOT}}', skillRoot)
+    .replaceAll('C:/Users/Marqu/Desktop/claude-video-watch', skillRoot)
     .replace(/^name:\s*.+$/m, `name: ${SKILL_NAME}`);
   writeFileSync(join(SKILL_DST, 'SKILL.md'), skillMd);
 

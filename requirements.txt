@@ -6,7 +6,7 @@ requests>=2.31.0
 # Provider SDKs. Install at least one matching your VIDEO_PROVIDER setting.
 # The installer writes VIDEO_PROVIDER to .env based on your pick.
 anthropic>=0.40.0
-google-generativeai>=0.8.0
+google-genai>=0.3.0
 
 # Optional: uncomment to enable the --whisper-api flag (uses OpenAI Whisper API)
 # openai>=1.50.0

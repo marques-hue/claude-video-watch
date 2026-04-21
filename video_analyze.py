@@ -30,22 +30,29 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import json
 import os
+import platform as _platform
+import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-# Load .env from this script's directory (written by the installer).
-# Silent no-op if python-dotenv isn't installed or no .env exists.
+SCHEMA_VERSION = 2
+ENV_PATH = Path(__file__).resolve().parent / ".env"
+_ENV_LOADED = False
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).resolve().parent / ".env")
+    if ENV_PATH.exists():
+        load_dotenv(ENV_PATH)
+        _ENV_LOADED = True
 except ImportError:
     pass
 
@@ -56,26 +63,35 @@ except ImportError:
 FFMPEG = "ffmpeg"
 FFPROBE = "ffprobe"
 
-# Scene-change threshold. 0.3 is a reasonable default for talking-head reels,
-# tutorial clips, and mid-energy social content. Tune lower (0.15-0.2) for
-# very static footage, higher (0.4-0.5) for rapid-cut content.
-SCENE_THRESHOLD = 0.3
-MIN_SCENE_FRAMES = 3  # if scene detection returns fewer, we fall back to fixed interval
+SCENE_THRESHOLD_DEFAULT = 0.4
+MIN_SCENE_FRAMES = 3
 FALLBACK_INTERVAL_SEC = 2.0
+FRAME_LONGEST_EDGE = 1024
 
 
 def run(cmd: list[str], capture: bool = True) -> subprocess.CompletedProcess:
-    """Run a subprocess command and return the completed process.
-
-    We capture stderr because ffmpeg writes informational output there, and
-    the showinfo filter emits timestamps we need to parse.
-    """
     return subprocess.run(
         cmd,
         capture_output=capture,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         check=False,
     )
+
+
+def probe_has_audio(video_path: Path) -> bool:
+    r = run([FFPROBE, "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=codec_type",
+             "-of", "csv=p=0", str(video_path)])
+    return bool((r.stdout or "").strip())
+
+
+def probe_has_video(video_path: Path) -> bool:
+    r = run([FFPROBE, "-v", "error", "-select_streams", "v",
+             "-show_entries", "stream=codec_type",
+             "-of", "csv=p=0", str(video_path)])
+    return bool((r.stdout or "").strip())
 
 
 def probe_duration(video_path: Path) -> float:
@@ -93,69 +109,62 @@ def probe_duration(video_path: Path) -> float:
 
 
 def extract_audio(video_path: Path, out_path: Path) -> None:
-    """Extract audio as 16kHz mono WAV - Whisper's native format.
-
-    Going straight to WAV at Whisper's sample rate avoids a lossy MP3 round
-    trip and shaves a few seconds off the pipeline for long videos.
-    """
     cmd = [
         FFMPEG, "-y", "-i", str(video_path),
-        "-vn",                 # no video
-        "-ac", "1",            # mono
-        "-ar", "16000",        # 16kHz
-        "-c:a", "pcm_s16le",   # 16-bit PCM
+        "-vn",
+        "-ac", "1",
+        "-ar", "16000",
+        "-c:a", "pcm_s16le",
         str(out_path),
     ]
     result = run(cmd)
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg audio extraction failed:\n{result.stderr}")
+        raise RuntimeError(f"ffmpeg audio extraction failed:\n{result.stderr or ''}")
 
 
-def extract_frames_scene(video_path: Path, frames_dir: Path) -> list[tuple[int, float, Path]]:
-    """Extract frames using scene-change detection.
+_SCALE_VF = (
+    f"scale='if(gt(iw,ih),{FRAME_LONGEST_EDGE},-2):"
+    f"if(gt(iw,ih),-2,{FRAME_LONGEST_EDGE})'"
+)
 
-    Returns a list of (index, timestamp_sec, frame_path). The timestamp is
-    the frame's offset in the source video, parsed from ffmpeg's showinfo
-    filter output on stderr.
 
-    If fewer than MIN_SCENE_FRAMES come back (static video, silent product
-    demo, anything with a single visual), we fall back to fixed-interval
-    sampling so Claude still gets visual coverage.
-    """
+def extract_frames_scene(
+    video_path: Path,
+    frames_dir: Path,
+    scene_threshold: float = SCENE_THRESHOLD_DEFAULT,
+) -> list[tuple[int, float, Path]]:
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    # Scene detection: select frames where the scene-change score exceeds
-    # SCENE_THRESHOLD, then pipe through showinfo so we can recover timestamps.
-    # We use a temp pattern and rename afterward because we need the real
-    # timestamps before we can name files properly.
     temp_pattern = frames_dir / "raw_%04d.jpg"
     cmd = [
         FFMPEG, "-y", "-i", str(video_path),
-        "-vf", f"select='gt(scene,{SCENE_THRESHOLD})',showinfo",
+        "-vf", f"select='gt(scene,{scene_threshold})',{_SCALE_VF},showinfo",
         "-vsync", "vfr",
-        "-q:v", "3",           # JPEG quality (2-5 is the sweet spot)
+        "-q:v", "5",
         str(temp_pattern),
     ]
     result = run(cmd)
 
-    # Parse timestamps from showinfo stderr. Lines look like:
-    #   [Parsed_showinfo_1 @ 0x...] n:0 pts:... pts_time:1.42 ...
+    stderr = result.stderr or ""
     ts_pattern = re.compile(r"pts_time:([\d.]+)")
-    timestamps = [float(m.group(1)) for m in ts_pattern.finditer(result.stderr)]
+    timestamps = [float(m.group(1)) for m in ts_pattern.finditer(stderr)]
 
-    # Collect the raw frames that actually got written.
     raw_frames = sorted(frames_dir.glob("raw_*.jpg"))
 
-    # If scene detection was too sparse, wipe and fall back to fixed interval.
     if len(raw_frames) < MIN_SCENE_FRAMES:
         for f in raw_frames:
             f.unlink()
         return extract_frames_interval(video_path, frames_dir)
 
-    # Pair raw frames with timestamps. If the counts disagree (rare, happens
-    # when showinfo buffering trims output), we fall back to interval naming.
     if len(raw_frames) != len(timestamps):
-        timestamps = [i * FALLBACK_INTERVAL_SEC for i in range(len(raw_frames))]
+        print(
+            f"      warning: frame/timestamp mismatch "
+            f"({len(raw_frames)} frames vs {len(timestamps)} ts) — falling back to interval",
+            file=sys.stderr,
+        )
+        for f in raw_frames:
+            f.unlink()
+        return extract_frames_interval(video_path, frames_dir)
 
     results: list[tuple[int, float, Path]] = []
     for i, (raw, ts) in enumerate(zip(raw_frames, timestamps), start=1):
@@ -167,19 +176,18 @@ def extract_frames_scene(video_path: Path, frames_dir: Path) -> list[tuple[int, 
 
 
 def extract_frames_interval(video_path: Path, frames_dir: Path) -> list[tuple[int, float, Path]]:
-    """Fallback frame extractor: one frame every FALLBACK_INTERVAL_SEC seconds."""
     frames_dir.mkdir(parents=True, exist_ok=True)
     temp_pattern = frames_dir / "int_%04d.jpg"
     fps = 1.0 / FALLBACK_INTERVAL_SEC
     cmd = [
         FFMPEG, "-y", "-i", str(video_path),
-        "-vf", f"fps={fps}",
-        "-q:v", "3",
+        "-vf", f"fps={fps},{_SCALE_VF}",
+        "-q:v", "5",
         str(temp_pattern),
     ]
     result = run(cmd)
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg frame extraction failed:\n{result.stderr}")
+        raise RuntimeError(f"ffmpeg frame extraction failed:\n{result.stderr or ''}")
 
     raw_frames = sorted(frames_dir.glob("int_*.jpg"))
     results: list[tuple[int, float, Path]] = []
@@ -209,11 +217,12 @@ class Transcript:
     words: list[Word] = field(default_factory=list)
 
 
-def transcribe_local(audio_path: Path, model_size: str) -> Transcript:
-    """Transcribe with faster-whisper, running on CPU by default.
-
-    We request word-level timestamps so Stage 3 can zip them to frames.
-    """
+def transcribe_local(
+    audio_path: Path,
+    model_size: str,
+    language: str | None = None,
+    vad_filter: bool = True,
+) -> tuple[Transcript, str]:
     try:
         from faster_whisper import WhisperModel
     except ImportError as e:
@@ -221,14 +230,12 @@ def transcribe_local(audio_path: Path, model_size: str) -> Transcript:
             "faster-whisper is not installed. Run: pip install -r requirements.txt"
         ) from e
 
-    # int8 CPU inference is the fastest workable combo on a dev laptop.
-    # Users with NVIDIA GPUs can edit this line to "cuda" / "float16".
     model = WhisperModel(model_size, device="cpu", compute_type="int8")
-    segments, _info = model.transcribe(
+    segments, info = model.transcribe(
         str(audio_path),
         word_timestamps=True,
-        vad_filter=False,
-        language="en",
+        vad_filter=vad_filter,
+        language=language,
     )
 
     words: list[Word] = []
@@ -238,11 +245,11 @@ def transcribe_local(audio_path: Path, model_size: str) -> Transcript:
         if seg.words:
             for w in seg.words:
                 words.append(Word(word=w.word.strip(), start=w.start, end=w.end))
-    return Transcript(text=" ".join(text_parts).strip(), words=words)
+    detected = getattr(info, "language", None) or (language or "unknown")
+    return Transcript(text=" ".join(text_parts).strip(), words=words), detected
 
 
-def transcribe_api(audio_path: Path) -> Transcript:
-    """Transcribe via OpenAI's Whisper API. Optional path, requires openai pkg."""
+def transcribe_api(audio_path: Path) -> tuple[Transcript, str]:
     try:
         from openai import OpenAI
     except ImportError as e:
@@ -271,7 +278,8 @@ def transcribe_api(audio_path: Path) -> Transcript:
             end=w["end"] if isinstance(w, dict) else w.end,
         ))
     text = getattr(response, "text", "") or ""
-    return Transcript(text=text.strip(), words=words)
+    lang = getattr(response, "language", None) or "unknown"
+    return Transcript(text=text.strip(), words=words), lang
 
 
 # --------------------------------------------------------------------------- #
@@ -319,89 +327,158 @@ def build_beats(
 # --------------------------------------------------------------------------- #
 
 MODEL = "claude-opus-4-7"
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
-SYSTEM_PROMPT = """You are a video analyst for a content creator who produces short-form social reels (TikTok, Instagram Reels, YouTube Shorts).
+SYSTEM_PROMPT = """You are analyzing a short-form video for a creator who wants to REPLICATE what works. You have beat-aligned data: for each timestamp you see the frame, the speech in that window, and the on-screen text visible in the frame.
 
-Your job is to reverse-engineer a video into its structural beats so the creator can hook-mine, swipe-file, and study retention structure.
+Use the alignment. When a hook lands, point to the exact timestamp and quote the words. When a retention mechanic is at play, name it (open-loop, pattern-interrupt, pay-off, contrast, escalation, social-proof, numeric-claim, contrarian-claim, tool-switch, callback).
 
-For every video you receive a sequence of timestamped beats. Each beat includes a still frame from the video and the words spoken during that frame's window. Treat them as synchronized: the visual and the speech are happening at the same moment.
+For each output field, the creator should be able to screenshot your answer and know what to do differently in the next video. Do NOT describe what the model "sees" — extract the technique.
 
-Produce a structured JSON analysis matching this schema exactly:
+Return JSON matching this schema exactly:
 
 {
-  "summary": "one-paragraph overall description",
-  "hook": "the first 0-2 seconds - what's the unhinged hook",
-  "agitate": "2-5 seconds - the pain agitation beat",
-  "re_hook": "the bracketed visual stage direction / reset moment",
-  "tell_them": "the value delivery middle",
-  "aha": "the payoff / aha moment",
-  "cta": "any mid-roll or end CTA present",
+  "schema_version": 2,
+  "summary": "2 sentences. No fluff.",
+  "hook": {
+    "quote": "verbatim words in first 0-2s",
+    "timestamp_seconds": 0.0,
+    "technique": "named technique",
+    "why_it_works": "one sentence, concrete"
+  },
+  "re_hook": {
+    "timestamp_seconds": 0.0,
+    "technique": "named pattern-interrupt / reset mechanic",
+    "what_would_happen_without_it": "one sentence naming the drop-off mechanism"
+  },
+  "agitate": { "quote": "...", "timestamp_seconds": 0.0 },
+  "aha_moment": { "quote": "...", "timestamp_seconds": 0.0, "setup": "what set it up" },
+  "cta": {
+    "type": "explicit | implicit | none",
+    "quote": "verbatim or visual description",
+    "timestamp_seconds": 0.0
+  },
+  "emotional_arc": [
+    { "beat_index": 1, "tone": "curious | urgent | calm | ...", "shift_from_previous": "..." }
+  ],
+  "retention_mechanics": [
+    { "timestamp_seconds": 0.0, "mechanic": "named pattern", "evidence": "quoted speech or named visual change" }
+  ],
   "visual_beats": [
-    {"t": 0.0, "description": "what's on screen", "action": "what's happening"}
+    { "timestamp_seconds": 0.0, "frame_description": "...", "unique_signal": "what differentiates this beat from the previous" }
   ],
   "on_screen_text": [
-    {"t": 0.0, "text": "extracted via OCR - read any text you see in the frames"}
+    { "timestamp_seconds": 0.0, "text": "...", "role": "title | caption | callout | brand | cta | numeric_proof" }
   ],
-  "audio_cues": ["music genre, sfx, tone markers"],
-  "emotional_arc": "how the emotional register shifts",
+  "audio_cues": [
+    { "timestamp_seconds": 0.0, "cue": "...", "role": "music_start | music_swell | sfx | silence | breath" }
+  ],
+  "replication_checklist": [
+    "3-7 concrete items a creator could copy into their next video"
+  ],
   "transcript": "full plain transcript"
 }
 
 Rules:
-- Read on-screen text directly from the frames. You have native OCR via vision.
-- If a field is not present (no CTA, no clear re-hook), return an empty string or empty array.
-- Do not invent content. If a beat is ambiguous, say so in its description.
-- No emojis anywhere in your output.
-- No em dashes. Use commas, periods, or parentheses.
+- "implicit" CTAs count: "go build it", directional glance toward caption, a visual that IS the pitch.
+- unique_signal CANNOT be "same creator talking". If the only signal is repetition, say so.
+- Read on-screen text directly from the frames (native vision OCR).
+- If a field is absent, return null (object fields) or an empty array. Never fabricate.
+- No emojis. No em dashes.
 - Return ONLY valid JSON. No preamble, no markdown code fences."""
 
 
-CHUNK_SYSTEM_PROMPT = """You are a video analyst processing one segment of a longer video.
+CHUNK_SYSTEM_PROMPT = """You are analyzing ONE window of a longer short-form video. Beat-aligned: each beat has a frame, the speech in that window, and the on-screen text visible.
 
-You receive timestamped beats from a single 60-second window. Each beat has a frame and the words spoken during that frame's window. Treat them as synchronized.
+Extract replication-level detail. Name techniques, don't describe them.
 
-Produce a compact JSON summary of this window only:
+Return JSON:
 
 {
   "window_start": 0.0,
   "window_end": 60.0,
-  "segment_summary": "one paragraph",
-  "visual_beats": [{"t": 0.0, "description": "what's on screen", "action": "what's happening"}],
-  "on_screen_text": [{"t": 0.0, "text": "any text visible in frames"}],
+  "segment_summary": "one sentence",
+  "visual_beats": [
+    { "timestamp_seconds": 0.0, "frame_description": "...", "unique_signal": "..." }
+  ],
+  "on_screen_text": [
+    { "timestamp_seconds": 0.0, "text": "...", "role": "title|caption|callout|brand|cta|numeric_proof" }
+  ],
+  "retention_mechanics": [
+    { "timestamp_seconds": 0.0, "mechanic": "...", "evidence": "..." }
+  ],
   "speech": "the words spoken in this window",
-  "emotional_register": "neutral | excited | angry | calm | authoritative | vulnerable | etc"
+  "emotional_register": "one-word tone tag"
 }
 
-Rules:
-- Read on-screen text directly from the frames (native vision OCR).
-- No emojis, no em dashes.
-- Return ONLY valid JSON. No markdown, no preamble."""
+Rules: read on-screen text from frames. No emojis, no em dashes. JSON only."""
 
 
-META_SYSTEM_PROMPT = """You are combining per-window summaries of a long video into one final structured analysis.
+META_SYSTEM_PROMPT = """You are combining per-window summaries of a long video into ONE final structured analysis.
 
-You receive an ordered list of window summaries plus the full transcript. Synthesize them into the final schema:
+You receive an ordered list of window summaries (each already contains visual_beats, on_screen_text, retention_mechanics arrays) plus the full transcript.
+
+Your job is the narrative fields only: summary, hook, re_hook, agitate, aha_moment, cta, emotional_arc, replication_checklist. Python code will concatenate the arrays — do NOT re-emit visual_beats, on_screen_text, retention_mechanics.
+
+Return JSON:
 
 {
-  "summary": "one-paragraph overall description",
-  "hook": "the first 0-2 seconds",
-  "agitate": "2-5 seconds - pain agitation",
-  "re_hook": "bracketed visual stage direction / reset moment",
-  "tell_them": "value delivery middle",
-  "aha": "payoff / aha moment",
-  "cta": "any CTA present",
-  "visual_beats": [{"t": 0.0, "description": "...", "action": "..."}],
-  "on_screen_text": [{"t": 0.0, "text": "..."}],
-  "audio_cues": ["music, sfx, tone markers"],
-  "emotional_arc": "how the emotional register shifts across the whole video",
-  "transcript": "full plain transcript"
+  "schema_version": 2,
+  "summary": "2 sentences",
+  "hook": { "quote": "...", "timestamp_seconds": 0.0, "technique": "...", "why_it_works": "..." },
+  "re_hook": { "timestamp_seconds": 0.0, "technique": "...", "what_would_happen_without_it": "..." },
+  "agitate": { "quote": "...", "timestamp_seconds": 0.0 },
+  "aha_moment": { "quote": "...", "timestamp_seconds": 0.0, "setup": "..." },
+  "cta": { "type": "explicit|implicit|none", "quote": "...", "timestamp_seconds": 0.0 },
+  "emotional_arc": [ { "beat_index": 1, "tone": "...", "shift_from_previous": "..." } ],
+  "replication_checklist": [ "3-7 concrete items" ]
 }
 
-Rules:
-- Preserve every visual_beat and on_screen_text entry from the window summaries, merged in timestamp order.
-- No emojis, no em dashes.
-- Return ONLY valid JSON."""
+Rules: null absent fields, no emojis, no em dashes. JSON only."""
+
+
+# --------------------------------------------------------------------------- #
+# Retry / backoff
+# --------------------------------------------------------------------------- #
+
+def _is_retryable(exc: BaseException) -> bool:
+    name = exc.__class__.__name__
+    if name in {
+        "APIStatusError", "APIConnectionError", "APITimeoutError",
+        "RateLimitError", "InternalServerError", "ServiceUnavailableError",
+        "ResourceExhausted", "ServiceUnavailable", "DeadlineExceeded",
+        "TooManyRequests", "ServerError", "ReadTimeout", "ConnectionError",
+    }:
+        return True
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    if status in (408, 429, 500, 502, 503, 504):
+        return True
+    return False
+
+
+def retry_api(max_attempts: int = 3, base_delay: float = 2.0) -> Callable:
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapped(*a, **kw):
+            last = None
+            for attempt in range(max_attempts):
+                try:
+                    return fn(*a, **kw)
+                except Exception as e:
+                    last = e
+                    if attempt == max_attempts - 1 or not _is_retryable(e):
+                        raise
+                    delay = base_delay * (4 ** attempt) + random.uniform(0, 1)
+                    print(
+                        f"      provider call retry {attempt + 1}/{max_attempts - 1} "
+                        f"after {e.__class__.__name__}: sleeping {delay:.1f}s",
+                        file=sys.stderr,
+                    )
+                    time.sleep(delay)
+            if last:
+                raise last
+        return wrapped
+    return deco
 
 
 def encode_frame(frame_path: Path) -> dict[str, Any]:
@@ -434,12 +511,16 @@ def build_beat_blocks(beats: list[Beat]) -> list[dict[str, Any]]:
     return blocks
 
 
+@retry_api()
+def _claude_create(anthropic_client, **kw):
+    return anthropic_client.messages.create(timeout=120, **kw)
+
+
 def call_claude_single(
     beats: list[Beat],
     transcript: Transcript,
     anthropic_client,
 ) -> dict[str, Any]:
-    """One-shot synthesis for short videos."""
     content: list[dict[str, Any]] = []
     content.append({
         "type": "text",
@@ -451,7 +532,8 @@ def call_claude_single(
         "text": "Return the JSON analysis now.",
     })
 
-    response = anthropic_client.messages.create(
+    response = _claude_create(
+        anthropic_client,
         model=MODEL,
         max_tokens=16000,
         system=[{
@@ -469,17 +551,10 @@ def call_claude_chunked(
     transcript: Transcript,
     anthropic_client,
 ) -> dict[str, Any]:
-    """Two-pass synthesis for long videos.
-
-    Chunk beats into 60-second windows, summarize each, then do a meta-pass
-    that combines the summaries into the final schema. This avoids blowing
-    through token budgets on videos with dozens of frames.
-    """
     window_size = 60.0
     if not beats:
         return empty_analysis(transcript)
 
-    # Bucket beats into 60-second windows keyed by floor(t / 60).
     buckets: dict[int, list[Beat]] = {}
     for b in beats:
         key = int(b.t // window_size)
@@ -497,17 +572,23 @@ def call_claude_chunked(
         content.extend(build_beat_blocks(window_beats))
         content.append({"type": "text", "text": "Return the window JSON now."})
 
-        response = anthropic_client.messages.create(
-            model=MODEL,
-            max_tokens=4000,
-            system=[{
-                "type": "text",
-                "text": CHUNK_SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"},
-            }],
-            messages=[{"role": "user", "content": content}],
-        )
-        window_json = extract_json(response_text(response))
+        try:
+            response = _claude_create(
+                anthropic_client,
+                model=MODEL,
+                max_tokens=4000,
+                system=[{
+                    "type": "text",
+                    "text": CHUNK_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                messages=[{"role": "user", "content": content}],
+            )
+            window_json = extract_json(response_text(response))
+        except Exception as e:
+            print(f"      window {start:.0f}-{end:.0f}s failed: {e}", file=sys.stderr)
+            window_json = None
+
         if window_json is None:
             window_json = {
                 "window_start": start,
@@ -515,33 +596,39 @@ def call_claude_chunked(
                 "segment_summary": "(parse failed)",
                 "visual_beats": [],
                 "on_screen_text": [],
+                "retention_mechanics": [],
                 "speech": " ".join(b.speech for b in window_beats),
                 "emotional_register": "unknown",
             }
         window_summaries.append(window_json)
 
-    # Meta-pass: combine windows into final schema. No images here, just the
-    # structured window data plus the full transcript.
     meta_content = [{
         "type": "text",
         "text": (
             "Full transcript:\n" + transcript.text +
             "\n\nWindow summaries (ordered):\n" +
             json.dumps(window_summaries, indent=2) +
-            "\n\nReturn the final JSON analysis now."
+            "\n\nReturn the final narrative JSON now (no arrays)."
         ),
     }]
-    meta_response = anthropic_client.messages.create(
-        model=MODEL,
-        max_tokens=16000,
-        system=[{
-            "type": "text",
-            "text": META_SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"},
-        }],
-        messages=[{"role": "user", "content": meta_content}],
-    )
-    return parse_response(meta_response, transcript)
+    try:
+        meta_response = _claude_create(
+            anthropic_client,
+            model=MODEL,
+            max_tokens=8000,
+            system=[{
+                "type": "text",
+                "text": META_SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }],
+            messages=[{"role": "user", "content": meta_content}],
+        )
+        narrative = parse_response(meta_response, transcript)
+    except Exception as e:
+        print(f"      meta-pass failed, assembling from windows only: {e}", file=sys.stderr)
+        narrative = _empty_narrative(transcript)
+
+    return _merge_windows_narrative(window_summaries, narrative, transcript)
 
 
 def response_text(response) -> str:
@@ -558,7 +645,6 @@ def response_text(response) -> str:
 # --------------------------------------------------------------------------- #
 
 def _gemini_beat_parts(beats: list[Beat]) -> list[Any]:
-    """Build a Gemini content list from beats: header text, PIL Image, speech text."""
     try:
         import PIL.Image
     except ImportError as e:
@@ -567,10 +653,26 @@ def _gemini_beat_parts(beats: list[Beat]) -> list[Any]:
     parts: list[Any] = []
     for i, beat in enumerate(beats, start=1):
         parts.append(f"--- Beat {i} at t={beat.t:.2f}s ---")
-        parts.append(PIL.Image.open(beat.frame_path))
+        with PIL.Image.open(beat.frame_path) as img:
+            img.load()
+            parts.append(img.copy())
         speech_line = beat.speech if beat.speech else "(no speech in this window)"
         parts.append(f"Speech: {speech_line}")
     return parts
+
+
+@retry_api()
+def _gemini_call(client, *, model: str, contents, system: str, max_output_tokens: int):
+    from google.genai import types
+    return client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            response_mime_type="application/json",
+            max_output_tokens=max_output_tokens,
+        ),
+    )
 
 
 def call_gemini_single(
@@ -578,20 +680,18 @@ def call_gemini_single(
     transcript: Transcript,
     gemini_client,
 ) -> dict[str, Any]:
-    """One-shot synthesis for short videos via Gemini."""
     content: list[Any] = [
-        SYSTEM_PROMPT,
         f"Full transcript (for reference):\n{transcript.text}\n\nBeats follow:",
     ]
     content.extend(_gemini_beat_parts(beats))
     content.append("Return the JSON analysis now.")
 
-    response = gemini_client.generate_content(
-        content,
-        generation_config={
-            "response_mime_type": "application/json",
-            "max_output_tokens": 16000,
-        },
+    response = _gemini_call(
+        gemini_client,
+        model=GEMINI_MODEL,
+        contents=content,
+        system=SYSTEM_PROMPT,
+        max_output_tokens=16000,
     )
     return parse_gemini_response(response, transcript)
 
@@ -601,7 +701,6 @@ def call_gemini_chunked(
     transcript: Transcript,
     gemini_client,
 ) -> dict[str, Any]:
-    """Two-pass synthesis for long videos via Gemini. Mirrors the Claude flow."""
     window_size = 60.0
     if not beats:
         return empty_analysis(transcript)
@@ -616,21 +715,23 @@ def call_gemini_chunked(
         window_beats = buckets[key]
         start = key * window_size
         end = start + window_size
-        content: list[Any] = [
-            CHUNK_SYSTEM_PROMPT,
-            f"Window: {start:.2f}s to {end:.2f}s",
-        ]
+        content: list[Any] = [f"Window: {start:.2f}s to {end:.2f}s"]
         content.extend(_gemini_beat_parts(window_beats))
         content.append("Return the window JSON now.")
 
-        response = gemini_client.generate_content(
-            content,
-            generation_config={
-                "response_mime_type": "application/json",
-                "max_output_tokens": 4000,
-            },
-        )
-        window_json = extract_json(gemini_response_text(response))
+        try:
+            response = _gemini_call(
+                gemini_client,
+                model=GEMINI_MODEL,
+                contents=content,
+                system=CHUNK_SYSTEM_PROMPT,
+                max_output_tokens=4000,
+            )
+            window_json = extract_json(gemini_response_text(response))
+        except Exception as e:
+            print(f"      window {start:.0f}-{end:.0f}s failed: {e}", file=sys.stderr)
+            window_json = None
+
         if window_json is None:
             window_json = {
                 "window_start": start,
@@ -638,27 +739,79 @@ def call_gemini_chunked(
                 "segment_summary": "(parse failed)",
                 "visual_beats": [],
                 "on_screen_text": [],
+                "retention_mechanics": [],
                 "speech": " ".join(b.speech for b in window_beats),
                 "emotional_register": "unknown",
             }
         window_summaries.append(window_json)
 
-    # Meta-pass: text-only combine into final schema.
     meta_content = [
-        META_SYSTEM_PROMPT,
         "Full transcript:\n" + transcript.text +
         "\n\nWindow summaries (ordered):\n" +
         json.dumps(window_summaries, indent=2) +
-        "\n\nReturn the final JSON analysis now.",
+        "\n\nReturn the final narrative JSON now (no arrays).",
     ]
-    meta_response = gemini_client.generate_content(
-        meta_content,
-        generation_config={
-            "response_mime_type": "application/json",
-            "max_output_tokens": 16000,
-        },
-    )
-    return parse_gemini_response(meta_response, transcript)
+    try:
+        meta_response = _gemini_call(
+            gemini_client,
+            model=GEMINI_MODEL,
+            contents=meta_content,
+            system=META_SYSTEM_PROMPT,
+            max_output_tokens=8000,
+        )
+        narrative = parse_gemini_response(meta_response, transcript)
+    except Exception as e:
+        print(f"      meta-pass failed, assembling from windows only: {e}", file=sys.stderr)
+        narrative = _empty_narrative(transcript)
+
+    return _merge_windows_narrative(window_summaries, narrative, transcript)
+
+
+def _empty_narrative(transcript: Transcript) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "summary": "(synthesis failed, assembled from window data only)",
+        "hook": None, "re_hook": None, "agitate": None,
+        "aha_moment": None, "cta": None,
+        "emotional_arc": [],
+        "replication_checklist": [],
+        "transcript": transcript.text,
+    }
+
+
+def _merge_windows_narrative(
+    windows: list[dict[str, Any]],
+    narrative: dict[str, Any],
+    transcript: Transcript,
+) -> dict[str, Any]:
+    visual_beats: list[Any] = []
+    on_screen_text: list[Any] = []
+    retention_mechanics: list[Any] = []
+    audio_cues: list[Any] = []
+    for w in windows:
+        visual_beats.extend(w.get("visual_beats") or [])
+        on_screen_text.extend(w.get("on_screen_text") or [])
+        retention_mechanics.extend(w.get("retention_mechanics") or [])
+        audio_cues.extend(w.get("audio_cues") or [])
+
+    def _ts(item):
+        if isinstance(item, dict):
+            return item.get("timestamp_seconds") or item.get("t") or 0.0
+        return 0.0
+
+    visual_beats.sort(key=_ts)
+    on_screen_text.sort(key=_ts)
+    retention_mechanics.sort(key=_ts)
+
+    out = dict(narrative)
+    out["schema_version"] = SCHEMA_VERSION
+    out["visual_beats"] = visual_beats
+    out["on_screen_text"] = on_screen_text
+    out["retention_mechanics"] = retention_mechanics
+    out["audio_cues"] = audio_cues
+    if not out.get("transcript"):
+        out["transcript"] = transcript.text
+    return out
 
 
 def gemini_response_text(response) -> str:
@@ -680,39 +833,53 @@ def gemini_response_text(response) -> str:
 
 
 def parse_gemini_response(response, transcript: Transcript) -> dict[str, Any]:
-    """Parse Gemini JSON response, filling transcript if missing."""
     text = gemini_response_text(response)
     data = extract_json(text)
     if data is None:
-        return {
-            "summary": "(synthesis failed to return parseable JSON)",
-            "hook": "", "agitate": "", "re_hook": "",
-            "tell_them": "", "aha": "", "cta": "",
-            "visual_beats": [], "on_screen_text": [],
-            "audio_cues": [], "emotional_arc": "",
-            "transcript": transcript.text,
-            "raw_response": text,
-        }
+        return _failed_analysis(transcript, text)
+    data.setdefault("schema_version", SCHEMA_VERSION)
     if not data.get("transcript"):
         data["transcript"] = transcript.text
     return data
 
 
 def extract_json(text: str) -> dict[str, Any] | None:
-    """Pull the first JSON object out of a text blob.
-
-    Claude is prompted to return raw JSON, but we guard against accidental
-    markdown fences or preamble.
-    """
-    # Strip ```json ... ``` fences if present.
+    if not text:
+        return None
     fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
     if fenced:
         text = fenced.group(1)
-    # Find the first balanced-ish top-level object.
+
     start = text.find("{")
     if start == -1:
         return None
-    # Try progressively shorter suffixes to recover from trailing garbage.
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                try:
+                    return json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    break
+
     for end in range(len(text), start, -1):
         try:
             return json.loads(text[start:end])
@@ -721,21 +888,28 @@ def extract_json(text: str) -> dict[str, Any] | None:
     return None
 
 
+def _failed_analysis(transcript: Transcript, raw: str) -> dict[str, Any]:
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "summary": "(synthesis failed to return parseable JSON)",
+        "hook": None, "re_hook": None, "agitate": None,
+        "aha_moment": None, "cta": None,
+        "emotional_arc": [],
+        "retention_mechanics": [],
+        "visual_beats": [], "on_screen_text": [],
+        "audio_cues": [],
+        "replication_checklist": [],
+        "transcript": transcript.text,
+        "raw_response": raw,
+    }
+
+
 def parse_response(response, transcript: Transcript) -> dict[str, Any]:
-    """Parse Claude's JSON response, filling in transcript if missing."""
     text = response_text(response)
     data = extract_json(text)
     if data is None:
-        return {
-            "summary": "(synthesis failed to return parseable JSON)",
-            "hook": "", "agitate": "", "re_hook": "",
-            "tell_them": "", "aha": "", "cta": "",
-            "visual_beats": [], "on_screen_text": [],
-            "audio_cues": [], "emotional_arc": "",
-            "transcript": transcript.text,
-            "raw_response": text,
-        }
-    # Make sure the transcript is always populated, even if Claude omitted it.
+        return _failed_analysis(transcript, text)
+    data.setdefault("schema_version", SCHEMA_VERSION)
     if not data.get("transcript"):
         data["transcript"] = transcript.text
     return data
@@ -743,11 +917,15 @@ def parse_response(response, transcript: Transcript) -> dict[str, Any]:
 
 def empty_analysis(transcript: Transcript) -> dict[str, Any]:
     return {
+        "schema_version": SCHEMA_VERSION,
         "summary": "(no beats extracted)",
-        "hook": "", "agitate": "", "re_hook": "",
-        "tell_them": "", "aha": "", "cta": "",
+        "hook": None, "re_hook": None, "agitate": None,
+        "aha_moment": None, "cta": None,
+        "emotional_arc": [],
+        "retention_mechanics": [],
         "visual_beats": [], "on_screen_text": [],
-        "audio_cues": [], "emotional_arc": "",
+        "audio_cues": [],
+        "replication_checklist": [],
         "transcript": transcript.text,
     }
 
@@ -756,44 +934,113 @@ def empty_analysis(transcript: Transcript) -> dict[str, Any]:
 # Report rendering
 # --------------------------------------------------------------------------- #
 
-def render_markdown(analysis: dict[str, Any], video_path: Path) -> str:
-    """Render the analysis dict as a human-friendly markdown report."""
+def _fmt_ts(x: Any) -> str:
+    try:
+        return f"{float(x):.2f}"
+    except (TypeError, ValueError):
+        return str(x)
+
+
+def _fmt_beat_field(val: Any, fields: list[str]) -> str:
+    if val is None:
+        return "(none detected)"
+    if isinstance(val, str):
+        return val
+    if isinstance(val, dict):
+        parts = []
+        if "quote" in val and val.get("quote"):
+            parts.append(f'"{val["quote"]}"')
+        ts = val.get("timestamp_seconds")
+        if ts is not None:
+            parts.append(f"@ {_fmt_ts(ts)}s")
+        for k in fields:
+            if k in val and val.get(k):
+                parts.append(f"[{k}: {val[k]}]")
+        return " ".join(parts) if parts else "(none detected)"
+    return str(val)
+
+
+def render_markdown(analysis: dict[str, Any], video_path: Path, detected_lang: str | None = None) -> str:
     lines: list[str] = []
     lines.append(f"# Video Analysis: {video_path.name}\n")
+    if detected_lang:
+        lines.append(f"_detected language: {detected_lang}_\n")
     lines.append(f"## Summary\n{analysis.get('summary', '')}\n")
 
-    retention_fields = [
-        ("Hook (0-2s)", "hook"),
-        ("Agitate (2-5s)", "agitate"),
-        ("Re-Hook", "re_hook"),
-        ("Tell Them", "tell_them"),
-        ("Aha Moment", "aha"),
-        ("CTA", "cta"),
-    ]
-    lines.append("## 5-Step Retention Structure\n")
-    for label, key in retention_fields:
-        value = analysis.get(key, "") or "(none detected)"
-        lines.append(f"**{label}:** {value}\n")
+    lines.append("## Retention Structure\n")
+    lines.append(f"**Hook:** {_fmt_beat_field(analysis.get('hook'), ['technique', 'why_it_works'])}\n")
+    lines.append(f"**Re-Hook:** {_fmt_beat_field(analysis.get('re_hook'), ['technique', 'what_would_happen_without_it'])}\n")
+    lines.append(f"**Agitate:** {_fmt_beat_field(analysis.get('agitate'), [])}\n")
+    lines.append(f"**Aha Moment:** {_fmt_beat_field(analysis.get('aha_moment') or analysis.get('aha'), ['setup'])}\n")
+    lines.append(f"**CTA:** {_fmt_beat_field(analysis.get('cta'), ['type'])}\n")
 
+    mechanics = analysis.get("retention_mechanics") or []
+    if mechanics:
+        lines.append("\n## Retention Mechanics\n")
+        for m in mechanics:
+            if isinstance(m, dict):
+                lines.append(
+                    f"- **t={_fmt_ts(m.get('timestamp_seconds'))}s** "
+                    f"`{m.get('mechanic', '')}` — {m.get('evidence', '')}"
+                )
+            else:
+                lines.append(f"- {m}")
+
+    checklist = analysis.get("replication_checklist") or []
+    if checklist:
+        lines.append("\n## Replication Checklist\n")
+        for item in checklist:
+            lines.append(f"- [ ] {item}")
+
+    arc = analysis.get("emotional_arc")
     lines.append("\n## Emotional Arc\n")
-    lines.append(analysis.get("emotional_arc", "") or "(none)")
+    if isinstance(arc, list) and arc:
+        for entry in arc:
+            if isinstance(entry, dict):
+                lines.append(
+                    f"- beat {entry.get('beat_index', '?')}: "
+                    f"{entry.get('tone', '')} — {entry.get('shift_from_previous', '')}"
+                )
+            else:
+                lines.append(f"- {entry}")
+    elif isinstance(arc, str) and arc:
+        lines.append(arc)
+    else:
+        lines.append("(none)")
 
-    lines.append("\n\n## Visual Beats\n")
+    lines.append("\n## Visual Beats\n")
     for b in analysis.get("visual_beats", []) or []:
-        t = b.get("t", 0)
-        desc = b.get("description", "")
-        action = b.get("action", "")
-        lines.append(f"- **t={t}s** {desc} // {action}")
+        if isinstance(b, dict):
+            ts = _fmt_ts(b.get("timestamp_seconds", b.get("t", 0)))
+            desc = b.get("frame_description", b.get("description", ""))
+            sig = b.get("unique_signal", b.get("action", ""))
+            lines.append(f"- **t={ts}s** {desc}  ·  _{sig}_")
 
-    lines.append("\n\n## On-Screen Text\n")
+    lines.append("\n## On-Screen Text\n")
     for t in analysis.get("on_screen_text", []) or []:
-        lines.append(f"- **t={t.get('t', 0)}s** {t.get('text', '')}")
+        if isinstance(t, dict):
+            ts = _fmt_ts(t.get("timestamp_seconds", t.get("t", 0)))
+            role = t.get("role")
+            role_s = f" ({role})" if role else ""
+            lines.append(f"- **t={ts}s** {t.get('text', '')}{role_s}")
 
-    lines.append("\n\n## Audio Cues\n")
-    for cue in analysis.get("audio_cues", []) or []:
-        lines.append(f"- {cue}")
+    cues = analysis.get("audio_cues") or []
+    if cues:
+        lines.append("\n## Audio Cues\n")
+        for cue in cues:
+            if isinstance(cue, dict):
+                lines.append(f"- **t={_fmt_ts(cue.get('timestamp_seconds'))}s** {cue.get('cue', '')} ({cue.get('role', '')})")
+            else:
+                lines.append(f"- {cue}")
 
-    lines.append("\n\n## Transcript\n")
+    raw = analysis.get("raw_response")
+    if raw:
+        lines.append("\n## Raw Synthesis Response (parse failed)\n")
+        lines.append("```")
+        lines.append(str(raw)[:4000])
+        lines.append("```")
+
+    lines.append("\n## Transcript\n")
     lines.append(analysis.get("transcript", "") or "")
 
     return "\n".join(lines)
@@ -803,11 +1050,23 @@ def render_markdown(analysis: dict[str, Any], video_path: Path) -> str:
 # CLI
 # --------------------------------------------------------------------------- #
 
+def _ffmpeg_hint() -> str:
+    sysname = _platform.system().lower()
+    if sysname == "windows":
+        return "install: winget install Gyan.FFmpeg"
+    if sysname == "darwin":
+        return "install: brew install ffmpeg"
+    return "install: sudo apt install ffmpeg"
+
+
+_URL_PREFIXES = ("http://", "https://", "www.", "youtube.com", "youtu.be", "tiktok.com", "instagram.com")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Analyze a video: extract frames, transcribe audio, align beats, synthesize with Claude.",
+        description="Analyze a local short-form video: extract frames, transcribe audio, align beats, synthesize retention breakdown.",
     )
-    parser.add_argument("video", type=Path, help="Path to the video file")
+    parser.add_argument("video", type=str, help="Path to the local video file")
     parser.add_argument(
         "--model", default="base",
         choices=["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"],
@@ -821,19 +1080,39 @@ def main() -> int:
         "--whisper-api", action="store_true",
         help="Use OpenAI Whisper API instead of local faster-whisper. Requires OPENAI_API_KEY.",
     )
+    parser.add_argument("--lang", default=None, help="Force transcription language (ISO code). Default: autodetect.")
+    parser.add_argument("--no-vad", action="store_true", help="Disable whisper VAD filter.")
+    parser.add_argument(
+        "--scene-threshold", type=float, default=SCENE_THRESHOLD_DEFAULT,
+        help=f"ffmpeg scene-change threshold (default: {SCENE_THRESHOLD_DEFAULT})",
+    )
     parser.add_argument(
         "--keep-work", action="store_true",
         help="Keep the intermediate work directory (frames, audio) for debugging.",
     )
     args = parser.parse_args()
 
-    video_path: Path = args.video.resolve()
+    raw_video = args.video
+    lower = raw_video.lower().lstrip()
+    if lower.startswith(_URL_PREFIXES):
+        print(
+            "ERROR: video-watch analyzes local files only. Download the video first and pass the local path.",
+            file=sys.stderr,
+        )
+        return 2
+
+    video_path: Path = Path(raw_video).resolve()
     if not video_path.exists():
         print(f"ERROR: video not found: {video_path}", file=sys.stderr)
         return 2
 
-    # Provider selection. Installer writes VIDEO_PROVIDER to .env.
-    # Default to anthropic for pre-installer backward compat.
+    if not _ENV_LOADED:
+        print(
+            f"warning: no .env at {ENV_PATH}; running with shell environment. "
+            f"Run 'npx video-watch-install' (or 'npx claude-video-install') to configure.",
+            file=sys.stderr,
+        )
+
     provider = (os.environ.get("VIDEO_PROVIDER") or "anthropic").strip().lower()
     if provider not in ("anthropic", "gemini"):
         print(
@@ -846,43 +1125,76 @@ def main() -> int:
     api_key = os.environ.get(key_var)
     if not api_key:
         print(f"ERROR: {key_var} env var not set.", file=sys.stderr)
-        print("Run: npx claude-video-install", file=sys.stderr)
+        print("Run: npx video-watch-install", file=sys.stderr)
         return 2
 
     output_path: Path = args.output.resolve() if args.output else video_path.with_suffix(
         video_path.suffix + ".analysis.json"
     )
 
-    # Sanity-check ffmpeg is on PATH.
     if shutil.which(FFMPEG) is None:
-        print("ERROR: ffmpeg not found on PATH.", file=sys.stderr)
+        print(f"ERROR: ffmpeg not found on PATH. {_ffmpeg_hint()}", file=sys.stderr)
+        return 2
+    if shutil.which(FFPROBE) is None:
+        print(f"ERROR: ffprobe not found on PATH. {_ffmpeg_hint()}", file=sys.stderr)
         return 2
 
-    # Work dir holds frames + audio. We clean it up unless --keep-work is set.
+    # Eager whisper import when using local path so we fail fast before ffmpeg runs.
+    if not args.whisper_api:
+        try:
+            import faster_whisper  # noqa: F401
+        except ImportError:
+            print(
+                "ERROR: faster-whisper is not installed. Run: pip install -r requirements.txt",
+                file=sys.stderr,
+            )
+            return 2
+
+    if not probe_has_video(video_path):
+        print(
+            f"ERROR: {video_path} contains no video stream. "
+            f"video-watch analyzes video content; use a transcription-only tool for audio.",
+            file=sys.stderr,
+        )
+        return 2
+    has_audio = probe_has_audio(video_path)
+
     work_dir = Path(tempfile.mkdtemp(prefix="videowatch_"))
+    detected_lang: str | None = None
     try:
         print(f"[1/4] Extracting audio + frames to {work_dir}", file=sys.stderr)
         audio_path = work_dir / "audio.wav"
-        extract_audio(video_path, audio_path)
+        if has_audio:
+            extract_audio(video_path, audio_path)
+        else:
+            print("      (no audio track — skipping audio extraction and transcription)", file=sys.stderr)
 
         frames_dir = work_dir / "frames"
-        frames = extract_frames_scene(video_path, frames_dir)
+        frames = extract_frames_scene(video_path, frames_dir, scene_threshold=args.scene_threshold)
         duration = probe_duration(video_path)
         print(
             f"      extracted {len(frames)} frames, duration={duration:.2f}s",
             file=sys.stderr,
         )
 
-        print(f"[2/4] Transcribing audio (model={args.model}, api={args.whisper_api})", file=sys.stderr)
-        if args.whisper_api:
-            transcript = transcribe_api(audio_path)
+        if has_audio:
+            print(f"[2/4] Transcribing audio (model={args.model}, api={args.whisper_api})", file=sys.stderr)
+            if args.whisper_api:
+                transcript, detected_lang = transcribe_api(audio_path)
+            else:
+                transcript, detected_lang = transcribe_local(
+                    audio_path, args.model,
+                    language=args.lang,
+                    vad_filter=not args.no_vad,
+                )
+            print(
+                f"      transcript length={len(transcript.text)} chars, "
+                f"{len(transcript.words)} words, detected_language={detected_lang}",
+                file=sys.stderr,
+            )
         else:
-            transcript = transcribe_local(audio_path, args.model)
-        print(
-            f"      transcript length={len(transcript.text)} chars, "
-            f"{len(transcript.words)} words",
-            file=sys.stderr,
-        )
+            transcript = Transcript(text="", words=[])
+            print("[2/4] (skipped — no audio)", file=sys.stderr)
 
         print("[3/4] Aligning beats", file=sys.stderr)
         beats = build_beats(frames, transcript, duration)
@@ -892,16 +1204,15 @@ def main() -> int:
         if provider == "gemini":
             print(f"[4/4] Synthesizing with Gemini ({GEMINI_MODEL})", file=sys.stderr)
             try:
-                import google.generativeai as genai
+                from google import genai  # type: ignore
             except ImportError:
                 print(
-                    "ERROR: google-generativeai not installed. "
+                    "ERROR: google-genai not installed. "
                     "Run: pip install -r requirements.txt",
                     file=sys.stderr,
                 )
                 return 2
-            genai.configure(api_key=api_key)
-            gemini_client = genai.GenerativeModel(GEMINI_MODEL)
+            gemini_client = genai.Client(api_key=api_key)
             if is_long:
                 print("      long video, using chunked synthesis", file=sys.stderr)
                 analysis = call_gemini_chunked(beats, transcript, gemini_client)
@@ -925,12 +1236,14 @@ def main() -> int:
             else:
                 analysis = call_claude_single(beats, transcript, client)
 
-        # Write JSON next to the video, print markdown report to stdout.
+        if detected_lang:
+            analysis["detected_language"] = detected_lang
+
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(analysis, f, indent=2, ensure_ascii=False)
         print(f"      JSON analysis written to {output_path}", file=sys.stderr)
 
-        print(render_markdown(analysis, video_path))
+        print(render_markdown(analysis, video_path, detected_lang=detected_lang))
         return 0
 
     finally:

@@ -1,82 +1,201 @@
-# claude-video
+# video-watch
 
-Teach Claude Code to watch videos. Drop a `.mp4`, `.mov`, `.webm`, `.mkv`, or `.m4v` into the conversation and Claude returns a structured breakdown: hook, agitate, re-hook, tell-them, aha, CTA. Plus visual beats, on-screen text, audio cues, and the full transcript.
+> analyze short-form video locally. retention, hooks, on-screen text, beat-aligned frames and speech — in a single command from your agent of choice.
 
-Built for short-form creators who want to hook-mine, swipe-file, and reverse-engineer retention structure.
+video-watch turns a local reel into a structured retention breakdown your next script can actually copy. point it at a `.mp4`, get back a JSON (and a human-readable markdown report) with:
 
-## Install
+- verbatim hook + timestamp + named technique
+- re-hook, agitate, aha-moment, cta (explicit/implicit/none) — each with timestamp and quote
+- named retention mechanics (pattern-interrupt, open-loop, numeric-claim, social-proof, pay-off)
+- beat-aligned frames, speech, and on-screen text at the same timestamps
+- a 3–7 item replication checklist you can paste into your next script
 
-```bash
-npx claude-video-install
-```
+no upload. no hosted storage. no paid tier. your own gemini or claude api key.
 
-The installer asks which provider you want (Gemini or Anthropic), writes your key to a local `.env`, and drops the skill into `~/.claude/skills/claude-video/`.
+---
 
-Gemini is the default pick: free tier, 15 requests per minute, enough for most reels.
+## install
 
-## Requirements
+video-watch installs into all five of these agents:
 
-- Python 3.10 or newer
-- `ffmpeg` on PATH ([install](https://ffmpeg.org/download.html))
-- Node 18+ (for the installer only)
-- An API key from one of:
-  - Google AI Studio — https://aistudio.google.com/app/apikey (free)
-  - Anthropic Console — https://console.anthropic.com/settings/keys (paid)
+- claude code
+- cursor
+- github copilot (vs code)
+- opencode
+- codex
 
-Python dependencies:
-
-```bash
-pip install -r ~/.claude/skills/claude-video/requirements.txt
-```
-
-## Usage
-
-After install, restart Claude Code. Then in any conversation:
-
-> watch this video: `/path/to/clip.mp4`
-
-Or:
-
-> break down this reel, what's the hook
-
-The skill picks up automatically. The pipeline runs four stages:
-
-1. **Extract** audio (16kHz mono WAV) and frames (scene-change detection) via ffmpeg
-2. **Transcribe** locally with faster-whisper
-3. **Align** transcript words to each frame so visuals and speech stay in sync
-4. **Synthesize** with Gemini or Claude (your pick) into a structured JSON report
-
-Output lands next to the video as `<video>.analysis.json` and renders a markdown summary in the Claude Code conversation.
-
-## Update
+### one command (recommended)
 
 ```bash
-npx claude-video-install
+npx skills add marques-hue/claude-video-watch
 ```
 
-Detects the existing install and offers to update files (keeping your `.env`) or wipe and reinstall.
+detects every installed agent on your machine and writes video-watch into all of them. safe on windows (uses junctions, falls back to copy). ported from [videodb's distribution pattern](https://github.com/video-db/skills) — see credit at the bottom.
 
-## Providers
+### branded installer (single-agent, more control)
 
-| Provider | Cost | Speed | Quality | When to pick |
-|---|---|---|---|---|
-| Gemini 2.5 Flash | free (15 req/min) | fast | matches Pro on short-form | default |
-| Gemini 2.5 Pro | free tier | slow | cleaner prose | long-form or client deliverables |
-| Claude Opus 4.7 | ~$0.20 / 90s video | slow | verbatim hook extraction, names gear in beats | when raw-source fidelity matters |
+```bash
+npx video-watch-install             # interactive, detects installed agents
+npx video-watch-install --agents all   # write to every detected agent
+npx video-watch-install --agent cursor # just cursor
+npx video-watch-install --global       # write to ~ instead of cwd
+npx video-watch-install doctor         # check your environment is ready
+npx video-watch-install update         # pull latest payload
+npx video-watch-install remove         # uninstall
+```
 
-Switching later: rerun `npx claude-video-install`, pick reset, choose the other provider.
+the installer prompts for your provider (gemini or anthropic), validates the api key prefix, masks it at entry, and runs `pip install -r requirements.txt` for you.
 
-## Troubleshooting
+### per-agent install paths
 
-- `ffmpeg not found on PATH` — install ffmpeg, restart your terminal
-- `faster-whisper is not installed` — run the pip install command above
-- Silent video or no transcript — expected. The frames still get analyzed.
-- `(synthesis failed to return parseable JSON)` — rerun, usually a cold-cache blip
+| agent | install writes to |
+|---|---|
+| claude code | `~/.claude/skills/video-watch/` (junction to canonical `~/.agents/skills/video-watch/`) |
+| cursor | `./.cursor/rules/video-watch.mdc` + payload in `.cursor/rules/video-watch/` |
+| github copilot | `~/.copilot/skills/video-watch/` |
+| opencode | `~/.config/opencode/skills/video-watch/` |
+| codex | `~/.codex/skills/video-watch/` |
 
-## License
+all five read the same `.env` and the same python script. a single install keeps every agent in sync.
 
-MIT. See [LICENSE](LICENSE).
+### prereqs
 
-## Who made this
+- python 3.10+
+- node 18+ (for the installer)
+- ffmpeg on PATH (windows: `winget install Gyan.FFmpeg`, mac: `brew install ffmpeg`, linux: `sudo apt install ffmpeg`)
+- one of: a gemini api key (free tier works) or an anthropic api key
 
-[@marquessystems](https://instagram.com/marquessystems) — solo founder, Henderson NV. Builds tools for freelancers escaping scope creep. See the Stability Score freelancer diagnostic at [stabilityscore.app](https://stabilityscore.app).
+---
+
+## quickstart
+
+once installed, tell any supported agent:
+
+```
+analyze C:/Users/me/Desktop/my-reel.mp4
+```
+
+or run the python directly:
+
+```bash
+python ~/.agents/skills/video-watch/video_analyze.py my-reel.mp4
+```
+
+the agent (or your terminal) produces `my-reel.analysis.json` plus a markdown report to stdout.
+
+### example breakdown (30s reel)
+
+input: a talking-head reel with a product demo cut.
+
+output (condensed):
+
+```json
+{
+  "schema_version": 2,
+  "summary": "Creator pitches Claude Code as a replacement for Canva-style workflows, using a live dashboard demo as proof.",
+  "hook": {
+    "quote": "Canva is about to become obsolete and here's why.",
+    "timestamp_seconds": 0.3,
+    "technique": "contrarian-claim + open-loop",
+    "why_it_works": "names a familiar brand being killed, forces the viewer to stay to learn the replacement."
+  },
+  "re_hook": {
+    "timestamp_seconds": 7.97,
+    "technique": "visual pattern-interrupt (tool-switch)",
+    "what_would_happen_without_it": "viewer drop-off at 8s — three consecutive talking-head frames would read as a single static beat and scroll intent returns."
+  },
+  "cta": {
+    "type": "implicit",
+    "quote": "just go build the thing yourself.",
+    "timestamp_seconds": 28.1
+  },
+  "retention_mechanics": [
+    { "timestamp_seconds": 0.3, "mechanic": "contrarian-claim", "evidence": "\"about to become obsolete\"" },
+    { "timestamp_seconds": 7.97, "mechanic": "pattern-interrupt (tool-switch)", "evidence": "cut from creator to claude dashboard" },
+    { "timestamp_seconds": 14.2, "mechanic": "numeric-proof", "evidence": "\"in about 4 seconds\"" }
+  ],
+  "replication_checklist": [
+    "open with a contrarian claim naming a brand your audience knows",
+    "cut to a tool-switch at 6-8 seconds",
+    "show a concrete numeric proof inside the first 15 seconds",
+    "end on an implicit build-it-yourself cta, not a follow-me cta"
+  ]
+}
+```
+
+this is what "creator-useful" means. not a model summary of the video — a technique-by-technique structure you can copy.
+
+---
+
+## new in v2
+
+### swipe file
+
+every analysis appends the hook to `~/.agents/skills/video-watch/swipefile.jsonl`. search it later:
+
+```bash
+video-watch swipe --tag pattern-interrupt
+video-watch swipe --search "you won't believe"
+```
+
+your personal hook library, grep-friendly, local-only.
+
+### fingerprint your own back catalog
+
+point it at a folder of your own past reels:
+
+```bash
+video-watch fingerprint ~/Desktop/my-reels/ --metrics views-and-saves.csv
+```
+
+aggregates retention mechanics across every video, cross-tabs against your success metric (a csv you maintain with `filename, views, saves`), and surfaces patterns you didn't consciously name. example output:
+
+```
+pattern-interrupt at 3-5s: 7 of your top 10 videos, 1 of your bottom 10
+numeric-claim hooks: correlate with 2.3x median saves
+implicit-cta: shows up in 9 of your top 10, 4 of your bottom 10
+```
+
+### compare mode
+
+feed three reels, find the shared structure:
+
+```bash
+video-watch compare reel-a.mp4 reel-b.mp4 reel-c.mp4
+```
+
+output is a single markdown file that names the retention structure shared across all three and which shared element is most likely causal. this is the teardown you'd do by hand, done for you.
+
+---
+
+## how it works
+
+1. ffmpeg extracts scene-change frames + 16khz mono audio.
+2. faster-whisper (local, cpu, int8) transcribes with word-level timestamps. language auto-detected. vad filter on.
+3. every frame is aligned to its speech window. frames downscaled to 1024px longest edge.
+4. the aligned beats (frame + speech + on-screen text at the same timestamp) are sent to gemini 2.5 flash or claude opus. short videos single-pass; long videos per-window then aggregated python-side so the `visual_beats` and `on_screen_text` arrays do not get dropped on long content.
+5. provider calls retry 3x with exponential backoff. partial progress preserved on fatal error.
+6. the synthesis prompt asks for named techniques and replication-level insight, not meta-description.
+7. json + markdown written to disk.
+
+---
+
+## docs
+
+full docs: [video-watch.dev/docs](https://video-watch.dev/docs) *(placeholder)*
+
+- [schema reference](https://video-watch.dev/docs/schema) — every field in the v2 analysis JSON
+- [swipe + fingerprint + compare guide](https://video-watch.dev/docs/moats)
+- [per-agent setup](https://video-watch.dev/docs/agents) — cursor mdc format, opencode skill frontmatter, codex sandbox approval, etc.
+
+---
+
+## credit
+
+video-watch's multi-agent distribution model is adapted from videodb's [skills](https://github.com/video-db/skills) repository and the underlying [vercel-labs/skills](https://github.com/vercel-labs/skills) cli. videodb's single-command install that quietly writes a SKILL.md into whichever of claude code, cursor, opencode, codex, or github copilot happens to be on the machine is the distribution pattern we are porting. we are not building a videodb competitor. videodb owns server-side video infrastructure — ingest, editing, streaming, live capture — for developers wiring video pipelines into apps. video-watch stays on the creator side: a local file in, a retention and hook and on-screen-text breakdown out, no backend, no paid tier. credit where it is due: the multi-agent symlink-to-canonical-dir install pattern and the "universal `.agents/skills`" convention are theirs. the creator-analysis thesis and the output shape are ours.
+
+---
+
+## license
+
+mit.
