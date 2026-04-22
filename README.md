@@ -168,15 +168,39 @@ output is a single markdown file that names the retention structure shared acros
 
 ---
 
+## new in v0.2
+
+### true native video for gemini
+
+gemini path no longer hacks around ffmpeg. the raw `.mp4` uploads directly through the google-genai File API, processes server-side, and gemini 2.5 flash or pro reads it at native framerate with full audio. no frame extraction. no whisper. no beat alignment. gemini hears music swells, sfx, silence, breath — the things a transcript strips out. populate `audio_cues` for free.
+
+fallback: pass `--gemini-legacy` to route the Gemini path back through the old ffmpeg+Whisper+beats pipeline. useful when the File API is down or your key is region-locked.
+
+### ocr-augmented frame analysis for claude
+
+anthropic has no native video input yet, so the Claude path keeps the ffmpeg hack, but each extracted frame now runs through easyocr before synthesis. the on-screen text is handed to the model as a dedicated `OCR:` line per beat, verbatim. Sonnet stops hallucinating text from downscaled JPEGs; the `on_screen_text` array now matches what is actually on screen.
+
+defaults flipped: Claude model is now `claude-sonnet-4-6` (set via `ANTHROPIC_MODEL` env). faster + cheaper than Opus for vision pass with no quality loss for this task. skip OCR with `--no-ocr`.
+
 ## how it works
+
+**gemini path (native):**
+
+1. raw video uploads to gemini File API via `client.files.upload`.
+2. poll until state is `ACTIVE` (a few seconds for short reels, up to a couple minutes for longer).
+3. pass the file handle and the system prompt to `gemini-2.5-flash` in one shot.
+4. gemini returns the full schema v2 JSON. file is deleted after.
+
+**claude path (ffmpeg + ocr + sonnet):**
 
 1. ffmpeg extracts scene-change frames + 16khz mono audio.
 2. faster-whisper (local, cpu, int8) transcribes with word-level timestamps. language auto-detected. vad filter on.
 3. every frame is aligned to its speech window. frames downscaled to 1024px longest edge.
-4. the aligned beats (frame + speech + on-screen text at the same timestamp) are sent to gemini 2.5 flash or claude opus. short videos single-pass; long videos per-window then aggregated python-side so the `visual_beats` and `on_screen_text` arrays do not get dropped on long content.
-5. provider calls retry 3x with exponential backoff. partial progress preserved on fatal error.
-6. the synthesis prompt asks for named techniques and replication-level insight, not meta-description.
-7. json + markdown written to disk.
+4. easyocr reads on-screen text from every frame before synthesis. attached to each beat as `beat.ocr_text`.
+5. aligned beats (frame + speech + OCR text at the same timestamp) are sent to claude-sonnet-4-6. short videos single-pass; long videos chunked into 60s windows + meta-pass so `visual_beats` and `on_screen_text` arrays survive long content.
+6. provider calls retry 3x with exponential backoff. partial progress preserved on fatal error.
+7. the synthesis prompt asks for named techniques and replication-level insight, not meta-description.
+8. json + markdown written to disk.
 
 ---
 

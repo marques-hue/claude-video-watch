@@ -3,8 +3,13 @@ python-dotenv>=1.0.0
 Pillow>=10.0.0
 requests>=2.31.0
 
+# V0.2: OCR pre-extraction for the Claude path. Heavy (~500MB torch dep) but
+# eliminates on-screen-text hallucination from downscaled JPEGs. Skip with --no-ocr.
+easyocr>=1.7.1
+
 # Provider SDKs. Install at least one matching your VIDEO_PROVIDER setting.
 # The installer writes VIDEO_PROVIDER to .env based on your pick.
+# google-genai is REQUIRED for the Gemini native File API path (V0.2).
 anthropic>=0.40.0
 google-genai>=0.3.0
 

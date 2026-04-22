@@ -1,29 +1,34 @@
 """
-video_analyze.py
+video_analyze.py  (V0.2)
 
-Pipeline that teaches Claude Code to "watch" a video. Four stages:
+Dual-provider pipeline. Two execution paths depending on VIDEO_PROVIDER.
 
-    Stage 1. Extract audio (16kHz mono WAV) and frames (scene-change detection)
-             using ffmpeg via subprocess. No moviepy.
-    Stage 2. Transcribe the audio locally with faster-whisper (or via the
-             OpenAI Whisper API if --whisper-api is passed).
-    Stage 3. Align transcript words to each extracted frame so every frame
-             has the speech that happened in its window. This is what makes
-             synthesis actually useful: Claude sees "at 0:14 speaker says X
-             while visual shows Y" instead of two disconnected streams.
-    Stage 4. Multimodal synthesis with Claude Opus 4.7. Base64-encoded frames
-             plus aligned speech go into the messages payload. Long videos
-             are chunked into 60s windows with a final meta-pass. A stable
-             system prompt is cached with cache_control so repeated runs
-             within 5 minutes hit the prompt cache.
+PATH A. Gemini (native multimodal):
+    Skip ffmpeg / Whisper / frame extraction entirely. Upload raw .mp4 via
+    the google-genai File API, poll until ACTIVE, pass the file directly
+    to gemini-2.5-flash/pro alongside the analysis prompt. Gemini hears
+    non-speech audio (music, SFX, silence) and sees native framerate.
 
-Output: structured JSON matching the schema in the --help text, plus a
-pretty-printed markdown report to stdout.
+PATH B. Anthropic (ffmpeg + OCR-augmented):
+    Anthropic has no native video input yet, so keep the hack but upgrade it:
+    Stage 1. ffmpeg extracts 16kHz mono WAV + scene-change JPEGs.
+    Stage 2. faster-whisper (local int8) or OpenAI Whisper API transcribes
+             with word-level timestamps.
+    Stage 3. easyocr reads on-screen text from each frame up-front, so
+             Sonnet does not hallucinate text from a downscaled JPEG.
+    Stage 4. Zip frame + speech-window + OCR into beats. Send to
+             claude-sonnet-4-6 (faster + cheaper than Opus for vision).
+             Long videos chunked into 60s windows + final meta-pass. Stable
+             system prompt cached via cache_control.
+
+Output: structured JSON + pretty markdown to stdout.
 
 Usage:
     python video_analyze.py <video> [--model base|small|medium|large]
                                     [--output path]
                                     [--whisper-api]
+                                    [--no-ocr]
+                                    [--gemini-legacy]
 """
 
 from __future__ import annotations
@@ -293,10 +298,14 @@ class Beat:
     A beat is the atomic unit we hand to Claude. Each one represents a
     moment in the video where we have both a visual and (possibly) some
     audio context. The synthesis prompt iterates over beats in order.
+
+    V0.2: ocr_text is populated up-front by easyocr so the model reads
+    the authoritative text, not a guess from a downscaled JPEG.
     """
     t: float
     frame_path: Path
     speech: str
+    ocr_text: str = ""
 
 
 def build_beats(
@@ -326,10 +335,13 @@ def build_beats(
 # Stage 4: multimodal synthesis (Anthropic or Gemini)
 # --------------------------------------------------------------------------- #
 
-MODEL = "claude-opus-4-7"
+MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_FILE_API_TIMEOUT_SEC = int(os.environ.get("GEMINI_FILE_API_TIMEOUT_SEC", "300"))
 
-SYSTEM_PROMPT = """You are analyzing a short-form video for a creator who wants to REPLICATE what works. You have beat-aligned data: for each timestamp you see the frame, the speech in that window, and the on-screen text visible in the frame.
+SYSTEM_PROMPT = """You are analyzing a short-form video for a creator who wants to REPLICATE what works. For each beat you are given three things: a frame image, a Speech line (the words spoken in that window), and an OCR line (on-screen text pre-extracted by easyocr).
+
+OCR rules: when the OCR line contains text, copy it VERBATIM into the on_screen_text array — do not reread the frame for text, the downscaled JPEG is unreliable. If OCR is "(no on-screen text detected)" trust that and only report text visible in structural UI (logos, brand marks).
 
 Use the alignment. When a hook lands, point to the exact timestamp and quote the words. When a retention mechanic is at play, name it (open-loop, pattern-interrupt, pay-off, contrast, escalation, social-proof, numeric-claim, contrarian-claim, tool-switch, callback).
 
@@ -382,13 +394,13 @@ Return JSON matching this schema exactly:
 Rules:
 - "implicit" CTAs count: "go build it", directional glance toward caption, a visual that IS the pitch.
 - unique_signal CANNOT be "same creator talking". If the only signal is repetition, say so.
-- Read on-screen text directly from the frames (native vision OCR).
+- Prefer the OCR line over guessing from the frame. Only fall back to frame reading when OCR is empty and text is clearly structural (a wordmark, a big brand lockup).
 - If a field is absent, return null (object fields) or an empty array. Never fabricate.
 - No emojis. No em dashes.
 - Return ONLY valid JSON. No preamble, no markdown code fences."""
 
 
-CHUNK_SYSTEM_PROMPT = """You are analyzing ONE window of a longer short-form video. Beat-aligned: each beat has a frame, the speech in that window, and the on-screen text visible.
+CHUNK_SYSTEM_PROMPT = """You are analyzing ONE window of a longer short-form video. Beat-aligned: each beat gives you a frame, a Speech line (words spoken in the window), and an OCR line (on-screen text pre-extracted by easyocr — use this verbatim, do not reread the frame for text).
 
 Extract replication-level detail. Name techniques, don't describe them.
 
@@ -411,7 +423,7 @@ Return JSON:
   "emotional_register": "one-word tone tag"
 }
 
-Rules: read on-screen text from frames. No emojis, no em dashes. JSON only."""
+Rules: copy on-screen text from the OCR line verbatim. No emojis, no em dashes. JSON only."""
 
 
 META_SYSTEM_PROMPT = """You are combining per-window summaries of a long video into ONE final structured analysis.
@@ -495,6 +507,63 @@ def encode_frame(frame_path: Path) -> dict[str, Any]:
     }
 
 
+# --------------------------------------------------------------------------- #
+# OCR (V0.2) — pre-extract on-screen text before handing frames to the model
+# --------------------------------------------------------------------------- #
+
+_OCR_READER = None
+
+
+def _get_ocr_reader():
+    global _OCR_READER
+    if _OCR_READER is not None:
+        return _OCR_READER
+    try:
+        import easyocr  # type: ignore
+    except ImportError as e:
+        raise RuntimeError(
+            "easyocr not installed. Run: pip install -r requirements.txt"
+        ) from e
+    _OCR_READER = easyocr.Reader(["en"], gpu=False, verbose=False)
+    return _OCR_READER
+
+
+def ocr_frames(
+    frames: list[tuple[int, float, Path]],
+    min_confidence: float = 0.4,
+) -> dict[str, str]:
+    """Run easyocr over every extracted frame. Returns {str(frame_path): joined_text}.
+
+    Low-confidence detections are dropped. Multiple detections on the same
+    frame are joined with " | " so the model sees them in spatial order.
+    """
+    reader = _get_ocr_reader()
+    out: dict[str, str] = {}
+    for _idx, _ts, path in frames:
+        try:
+            results = reader.readtext(str(path), detail=1, paragraph=False)
+        except Exception as e:
+            print(f"      OCR failed on {path.name}: {e}", file=sys.stderr)
+            out[str(path)] = ""
+            continue
+        texts: list[str] = []
+        for item in results:
+            if len(item) >= 3:
+                _, text, conf = item[0], item[1], item[2]
+                if conf is None or conf >= min_confidence:
+                    if text and text.strip():
+                        texts.append(text.strip())
+            elif len(item) == 2 and item[1]:
+                texts.append(str(item[1]).strip())
+        out[str(path)] = " | ".join(texts).strip()
+    return out
+
+
+def attach_ocr_to_beats(beats: list[Beat], ocr_map: dict[str, str]) -> None:
+    for b in beats:
+        b.ocr_text = ocr_map.get(str(b.frame_path), "")
+
+
 def build_beat_blocks(beats: list[Beat]) -> list[dict[str, Any]]:
     """Turn beats into an interleaved content array for the Anthropic API.
 
@@ -508,6 +577,8 @@ def build_beat_blocks(beats: list[Beat]) -> list[dict[str, Any]]:
         blocks.append(encode_frame(beat.frame_path))
         speech_line = beat.speech if beat.speech else "(no speech in this window)"
         blocks.append({"type": "text", "text": f"Speech: {speech_line}"})
+        ocr_line = beat.ocr_text if beat.ocr_text else "(no on-screen text detected)"
+        blocks.append({"type": "text", "text": f"OCR: {ocr_line}"})
     return blocks
 
 
@@ -658,6 +729,8 @@ def _gemini_beat_parts(beats: list[Beat]) -> list[Any]:
             parts.append(img.copy())
         speech_line = beat.speech if beat.speech else "(no speech in this window)"
         parts.append(f"Speech: {speech_line}")
+        ocr_line = beat.ocr_text if beat.ocr_text else "(no on-screen text detected)"
+        parts.append(f"OCR: {ocr_line}")
     return parts
 
 
@@ -765,6 +838,93 @@ def call_gemini_chunked(
         narrative = _empty_narrative(transcript)
 
     return _merge_windows_narrative(window_summaries, narrative, transcript)
+
+
+# --------------------------------------------------------------------------- #
+# Gemini native File API path (V0.2) — skip ffmpeg/Whisper entirely
+# --------------------------------------------------------------------------- #
+
+@retry_api()
+def _gemini_native_generate(client, *, model: str, contents, system: str, max_output_tokens: int):
+    from google.genai import types
+    return client.models.generate_content(
+        model=model,
+        contents=contents,
+        config=types.GenerateContentConfig(
+            system_instruction=system,
+            response_mime_type="application/json",
+            max_output_tokens=max_output_tokens,
+        ),
+    )
+
+
+def call_gemini_native_file(
+    video_path: Path,
+    gemini_client,
+) -> dict[str, Any]:
+    """Upload the raw video to Gemini's File API and let Gemini read it natively.
+
+    Gemini 2.5 supports video files directly: it sees native framerate and
+    hears the full audio stream (music + SFX + silence + speech), so we
+    skip our ffmpeg/Whisper hack entirely. No beats, no frame extraction.
+    """
+    print(
+        f"      uploading {video_path.name} to Gemini File API "
+        f"({video_path.stat().st_size / (1024*1024):.1f} MB)",
+        file=sys.stderr,
+    )
+    uploaded = gemini_client.files.upload(file=str(video_path))
+
+    deadline = time.time() + GEMINI_FILE_API_TIMEOUT_SEC
+    while True:
+        info = gemini_client.files.get(name=uploaded.name)
+        state = getattr(info, "state", None)
+        state_name = getattr(state, "name", None) or str(state or "")
+        if state_name == "ACTIVE":
+            uploaded = info
+            break
+        if state_name == "FAILED":
+            raise RuntimeError(
+                f"Gemini File API reported FAILED processing {video_path.name}"
+            )
+        if time.time() > deadline:
+            raise RuntimeError(
+                f"Gemini File API processing timed out after "
+                f"{GEMINI_FILE_API_TIMEOUT_SEC}s for {video_path.name}"
+            )
+        time.sleep(2.0)
+
+    print(f"      file ACTIVE, calling {GEMINI_MODEL} with native video", file=sys.stderr)
+
+    user_prompt = (
+        "Watch this video end-to-end. You have native access to every frame "
+        "and the full audio stream (speech, music, SFX, silence). Extract the "
+        "retention structure per the system schema. Include on-screen text "
+        "verbatim (you have native OCR), and populate audio_cues for music "
+        "swells, silence beats, and SFX that the speech transcript cannot "
+        "capture. Return the JSON analysis now."
+    )
+    contents = [uploaded, user_prompt]
+
+    transcript_placeholder = Transcript(text="", words=[])
+    try:
+        response = _gemini_native_generate(
+            gemini_client,
+            model=GEMINI_MODEL,
+            contents=contents,
+            system=SYSTEM_PROMPT,
+            max_output_tokens=16000,
+        )
+        return parse_gemini_response(response, transcript_placeholder)
+    finally:
+        try:
+            gemini_client.files.delete(name=uploaded.name)
+        except Exception as e:
+            print(
+                f"      warning: could not delete uploaded Gemini file "
+                f"{uploaded.name}: {e}",
+                file=sys.stderr,
+            )
 
 
 def _empty_narrative(transcript: Transcript) -> dict[str, Any]:
@@ -1090,6 +1250,15 @@ def main() -> int:
         "--keep-work", action="store_true",
         help="Keep the intermediate work directory (frames, audio) for debugging.",
     )
+    parser.add_argument(
+        "--no-ocr", action="store_true",
+        help="Disable easyocr pre-extraction (Claude path only).",
+    )
+    parser.add_argument(
+        "--gemini-legacy", action="store_true",
+        help="Force the Gemini path through the legacy ffmpeg+Whisper+frames hack "
+             "instead of the native File API. Useful when File API is unavailable.",
+    )
     args = parser.parse_args()
 
     raw_video = args.video
@@ -1132,37 +1301,66 @@ def main() -> int:
         video_path.suffix + ".analysis.json"
     )
 
-    if shutil.which(FFMPEG) is None:
-        print(f"ERROR: ffmpeg not found on PATH. {_ffmpeg_hint()}", file=sys.stderr)
-        return 2
-    if shutil.which(FFPROBE) is None:
-        print(f"ERROR: ffprobe not found on PATH. {_ffmpeg_hint()}", file=sys.stderr)
-        return 2
+    gemini_native = (provider == "gemini") and not args.gemini_legacy
 
-    # Eager whisper import when using local path so we fail fast before ffmpeg runs.
-    if not args.whisper_api:
-        try:
-            import faster_whisper  # noqa: F401
-        except ImportError:
+    if not gemini_native:
+        if shutil.which(FFMPEG) is None:
+            print(f"ERROR: ffmpeg not found on PATH. {_ffmpeg_hint()}", file=sys.stderr)
+            return 2
+        if shutil.which(FFPROBE) is None:
+            print(f"ERROR: ffprobe not found on PATH. {_ffmpeg_hint()}", file=sys.stderr)
+            return 2
+
+        # Eager whisper import so we fail fast before ffmpeg runs.
+        if not args.whisper_api:
+            try:
+                import faster_whisper  # noqa: F401
+            except ImportError:
+                print(
+                    "ERROR: faster-whisper is not installed. Run: pip install -r requirements.txt",
+                    file=sys.stderr,
+                )
+                return 2
+
+        if not probe_has_video(video_path):
             print(
-                "ERROR: faster-whisper is not installed. Run: pip install -r requirements.txt",
+                f"ERROR: {video_path} contains no video stream. "
+                f"video-watch analyzes video content; use a transcription-only tool for audio.",
                 file=sys.stderr,
             )
             return 2
+        has_audio = probe_has_audio(video_path)
+    else:
+        has_audio = True  # unused in the Gemini native path
 
-    if not probe_has_video(video_path):
-        print(
-            f"ERROR: {video_path} contains no video stream. "
-            f"video-watch analyzes video content; use a transcription-only tool for audio.",
-            file=sys.stderr,
-        )
-        return 2
-    has_audio = probe_has_audio(video_path)
-
-    work_dir = Path(tempfile.mkdtemp(prefix="videowatch_"))
     detected_lang: str | None = None
+
+    # --- Path A: Gemini native File API (no ffmpeg, no Whisper, no frames) ---
+    if gemini_native:
+        print(f"[1/1] Synthesizing with Gemini native File API ({GEMINI_MODEL})", file=sys.stderr)
+        try:
+            from google import genai  # type: ignore
+        except ImportError:
+            print(
+                "ERROR: google-genai not installed. "
+                "Run: pip install -r requirements.txt",
+                file=sys.stderr,
+            )
+            return 2
+        gemini_client = genai.Client(api_key=api_key)
+        analysis = call_gemini_native_file(video_path, gemini_client)
+
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(analysis, f, indent=2, ensure_ascii=False)
+        print(f"      JSON analysis written to {output_path}", file=sys.stderr)
+
+        print(render_markdown(analysis, video_path, detected_lang=None))
+        return 0
+
+    # --- Path B: Anthropic (ffmpeg + Whisper + OCR + Sonnet) ---
+    work_dir = Path(tempfile.mkdtemp(prefix="videowatch_"))
     try:
-        print(f"[1/4] Extracting audio + frames to {work_dir}", file=sys.stderr)
+        print(f"[1/5] Extracting audio + frames to {work_dir}", file=sys.stderr)
         audio_path = work_dir / "audio.wav"
         if has_audio:
             extract_audio(video_path, audio_path)
@@ -1178,7 +1376,7 @@ def main() -> int:
         )
 
         if has_audio:
-            print(f"[2/4] Transcribing audio (model={args.model}, api={args.whisper_api})", file=sys.stderr)
+            print(f"[2/5] Transcribing audio (model={args.model}, api={args.whisper_api})", file=sys.stderr)
             if args.whisper_api:
                 transcript, detected_lang = transcribe_api(audio_path)
             else:
@@ -1194,15 +1392,35 @@ def main() -> int:
             )
         else:
             transcript = Transcript(text="", words=[])
-            print("[2/4] (skipped — no audio)", file=sys.stderr)
+            print("[2/5] (skipped — no audio)", file=sys.stderr)
 
-        print("[3/4] Aligning beats", file=sys.stderr)
+        print("[3/5] Aligning beats", file=sys.stderr)
         beats = build_beats(frames, transcript, duration)
+
+        if args.no_ocr:
+            print("[4/5] OCR skipped (--no-ocr)", file=sys.stderr)
+        else:
+            print(f"[4/5] Running OCR over {len(frames)} frames (easyocr)", file=sys.stderr)
+            try:
+                ocr_map = ocr_frames(frames)
+                attach_ocr_to_beats(beats, ocr_map)
+                hits = sum(1 for b in beats if b.ocr_text)
+                print(
+                    f"      OCR produced text on {hits}/{len(beats)} beats",
+                    file=sys.stderr,
+                )
+            except Exception as e:
+                print(
+                    f"      OCR failed ({e}); continuing without on-screen-text hints",
+                    file=sys.stderr,
+                )
 
         is_long = duration > 90 or len(frames) > 20
 
         if provider == "gemini":
-            print(f"[4/4] Synthesizing with Gemini ({GEMINI_MODEL})", file=sys.stderr)
+            # Legacy Gemini path: same ffmpeg+Whisper+beats pipeline as Claude,
+            # only reached when --gemini-legacy is passed.
+            print(f"[5/5] Synthesizing with Gemini (legacy, {GEMINI_MODEL})", file=sys.stderr)
             try:
                 from google import genai  # type: ignore
             except ImportError:
@@ -1219,7 +1437,7 @@ def main() -> int:
             else:
                 analysis = call_gemini_single(beats, transcript, gemini_client)
         else:
-            print(f"[4/4] Synthesizing with Claude ({MODEL})", file=sys.stderr)
+            print(f"[5/5] Synthesizing with Claude ({MODEL})", file=sys.stderr)
             try:
                 import anthropic
             except ImportError:
