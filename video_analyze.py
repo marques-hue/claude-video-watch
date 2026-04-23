@@ -337,7 +337,7 @@ def build_beats(
 
 MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_FILE_API_TIMEOUT_SEC = int(os.environ.get("GEMINI_FILE_API_TIMEOUT_SEC", "300"))
+GEMINI_FILE_API_TIMEOUT_SEC = int(os.environ.get("GEMINI_FILE_API_TIMEOUT_SEC", "900"))
 
 SYSTEM_PROMPT = """You are analyzing a short-form video for a creator who wants to REPLICATE what works. For each beat you are given three things: a frame image, a Speech line (the words spoken in that window), and an OCR line (on-screen text pre-extracted by easyocr).
 
