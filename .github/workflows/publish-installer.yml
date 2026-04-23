@@ -1,0 +1,53 @@
+name: publish-installer
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "installer/**"
+      - "video_analyze.py"
+      - "requirements.txt"
+      - "skills/**"
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Check if installer version is new
+        id: check
+        working-directory: installer
+        run: |
+          LOCAL=$(node -p "require('./package.json').version")
+          REMOTE=$(npm view claude-video-install version 2>/dev/null || echo "0.0.0")
+          echo "local=$LOCAL"
+          echo "remote=$REMOTE"
+          if [ "$LOCAL" = "$REMOTE" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "installer/package.json version ($LOCAL) matches npm ($REMOTE), skipping publish"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "will publish $LOCAL"
+          fi
+
+      - name: Install
+        if: steps.check.outputs.skip == 'false'
+        working-directory: installer
+        run: npm ci
+
+      - name: Publish
+        if: steps.check.outputs.skip == 'false'
+        working-directory: installer
+        run: npm publish --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
