@@ -1,6 +1,6 @@
 {
   "name": "claude-video-install",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Installer for the claude-video Claude Code skill — teach Claude Code to watch videos.",
   "homepage": "https://github.com/marques-hue/claude-video-watch",
   "repository": {
